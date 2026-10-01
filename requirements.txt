@@ -1,0 +1,8 @@
+flask
+mysqlclient
+flask-cors
+openai
+pypdf
+numpy
+faiss-cpu
+python-dotenv
