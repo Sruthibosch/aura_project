@@ -1,6 +1,7 @@
 import { AuraMark } from "./BrandIcons";
 
-import CourseViewer from "./CourseViewer";
+import CourseViewer, { type Course as EditableCourse } from "./CourseViewer";
+import CourseEditor, { EDITOR_DRAFT_KEY } from "./CourseEditor";
 import type { CourseDomainMetadata } from "./courseDomains";
 import CourseFeed, { type FeedCourse } from "./CourseFeed";
 import {
@@ -14,6 +15,47 @@ import {
 } from "react";
 
 
+type GenerationProgress = {
+  stage: string;
+  message: string;
+  title?: string;
+  module?: { index: number; title: string; slides: number };
+  imageTotal?: number;
+  imageDone?: number;
+};
+
+async function readCourseGeneration(response: Response, onProgress: (event: GenerationProgress) => void): Promise<{ course: GeneratedCourse }> {
+  if (!response.headers.get("content-type")?.includes("application/x-ndjson")) {
+    return response.json(); // Compatibility with a backend still returning JSON.
+  }
+  if (!response.body) throw new Error("Live progress is unavailable. Please try again.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: { course: GeneratedCourse } | undefined;
+  const consume = (line: string) => {
+    if (!line.trim()) return;
+    const event = JSON.parse(line);
+    if (event.type === "progress") onProgress(event);
+    if (event.type === "error") throw new Error(event.message || "Course generation failed.");
+    if (event.type === "complete") result = event.payload;
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      lines.forEach(consume);
+      if (done) { consume(buffer); break; }
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  if (!result?.course) throw new Error("The connection ended before your course was ready. Please try again.");
+  return result;
+}
 
 type ScreenId =
   | "home"
@@ -58,49 +100,7 @@ type CourseModule = {
   content: string;
 };
 
-type GeneratedCourseSlide = {
-  id: number;
-  title: string;
-  content: string;
-  keyPoints: string[];
-  example: string;
-};
-
-type GeneratedCourseModule = {
-  id: number;
-  title: string;
-  introduction: string;
-  learningObjectives: string[];
-  slides: GeneratedCourseSlide[];
-  recap: string | string[];
-};
-
-type AssessmentQuestion = {
-  id: number;
-  type: string;
-  question: string;
-  options: string[];
-  correctAnswer: string;
-  explanation: string;
-};
-
-type CourseTheme = {
-  style: string;
-  background: string;
-  surface: string;
-  text: string;
-  accent: string;
-  font: string;
-};
-
-type GeneratedCourse = CourseDomainMetadata & {
-  title: string;
-  description: string;
-  learningObjectives: string[];
-  theme: CourseTheme;
-  modules: GeneratedCourseModule[];
-  assessment: AssessmentQuestion[];
-};
+type GeneratedCourse = EditableCourse & CourseDomainMetadata;
 
 type CourseDraft = {
   title: string;
@@ -113,6 +113,7 @@ type CourseDraft = {
 
 type SavedCourseDraft = CourseDomainMetadata & {
   id: number;
+  status: "draft" | "published";
   title: string;
   description: string;
   audience: string;
@@ -143,6 +144,7 @@ const navigation: { id: ScreenId; label: string }[] = [
   { id: "courses", label: "My Courses" },
   { id: "builder", label: "Course Builder" },
 ];
+
 
 function NavIcon({ name }: { name: ScreenId }) {
   const common = { fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
@@ -334,17 +336,34 @@ function App() {
   const [isSending, setIsSending] =
     useState(false);
 
+  const [isIngestionOpen, setIsIngestionOpen] = useState(false);
+  const [sourceUrl, setSourceUrl] = useState("");
+  const [ingestionError, setIngestionError] = useState("");
+  const [isFileDragActive, setIsFileDragActive] = useState(false);
+
   const [isUploading, setIsUploading] =
     useState(false);
 
   const [isGeneratingCourse, setIsGeneratingCourse] =
     useState(false);
 
+
   const [generatedCourse, setGeneratedCourse] =
   useState<GeneratedCourse | null>(null);
+  const [isCourseEditorOpen, setIsCourseEditorOpen] = useState(false);
+
+  const [recoverableDraft, setRecoverableDraft] = useState<{ course: GeneratedCourse; documentId: number | null } | null>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(EDITOR_DRAFT_KEY) || "null");
+      if (saved?.course && typeof saved.course.title === "string" && Array.isArray(saved.course.modules) && Array.isArray(saved.course.assessment)) return saved;
+    } catch { /* Browser storage may be disabled. */ }
+    return null;
+  });
 
   const [selectedSavedCourse, setSelectedSavedCourse] =
     useState<GeneratedCourse | null>(null);
+
+  const [editingSavedCourseId, setEditingSavedCourseId] = useState<number | null>(null);
 
   const [courseSaveMessage, setCourseSaveMessage] =
     useState("");
@@ -569,7 +588,7 @@ function App() {
   }, [chatMessages, isGeneratingCourse]);
 
   /* =====================================================
-     PDF UPLOAD
+     CONTENT INGESTION
      ===================================================== */
 
   const handleFileSelected = async (
@@ -584,6 +603,33 @@ function App() {
       return;
     }
 
+    await ingestSource(file);
+  };
+
+  const ingestSource = async (source: File | string) => {
+    if (isUploading || isGeneratingCourse) return;
+    setIngestionError("");
+    if (typeof source !== "string") {
+      if (!/\.(pdf|docx|pptx)$/i.test(source.name)) {
+        setIngestionError("Choose a PDF, DOCX, or PPTX file.");
+        return;
+      }
+      if (source.size > 20 * 1024 * 1024) {
+        setIngestionError("Source exceeds the 20MB limit.");
+        return;
+      }
+    } else {
+      source = source.trim();
+      try {
+        const url = new URL(source);
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+      } catch {
+        setIngestionError("Enter a valid HTTP or HTTPS link.");
+        return;
+      }
+    }
+    // Close the source picker immediately; processing continues in the chat.
+    setIsIngestionOpen(false);
     setActiveScreen("home");
     setSelectedSavedCourse(null);
     setGeneratedCourse(null);
@@ -594,33 +640,27 @@ function App() {
       {
         id: crypto.randomUUID(),
         role: "user",
-        content: `📄 Uploaded ${file.name}`,
+        content: typeof source === "string" ? `🔗 Added ${source}` : `📄 Uploaded ${source.name}`,
       },
     ]);
 
     try {
-      const formData = new FormData();
-
-      formData.append("file", file);
-
-      /*
-       * Keep sending the session ID.
-       * The upload API currently only needs the file,
-       * but this keeps the frontend ready for chat-history
-       * integration.
-       */
-      formData.append(
-        "sessionId",
-        sessionId,
-      );
-
-      const response = await fetch(
-        `${API_BASE}/api/pdf/upload`,
-        {
+      let response: Response;
+      if (typeof source === "string") {
+        response = await fetch(`${API_BASE}/api/content/link`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: source, sessionId }),
+        });
+      } else {
+        const formData = new FormData();
+        formData.append("file", source);
+        formData.append("sessionId", sessionId);
+        response = await fetch(`${API_BASE}/api/content/upload`, {
           method: "POST",
           body: formData,
-        },
-      );
+        });
+      }
 
       if (!response.ok) {
         let backendError = "";
@@ -639,7 +679,7 @@ function App() {
 
         throw new Error(
           backendError ||
-            `Unable to upload PDF (${response.status})`,
+            `Unable to add source (${response.status})`,
         );
       }
 
@@ -653,6 +693,8 @@ function App() {
       // setActiveDocumentId(
       //   payload.documentId,
       // );
+      setIsIngestionOpen(false);
+      setSourceUrl("");
       activeDocumentIdRef.current = payload.documentId;
       
       setActiveDocumentId(
@@ -674,10 +716,11 @@ function App() {
           id: crypto.randomUUID(),
           role: "assistant",
           content:
-            "Great. I have your PDF. Before I create the course, I need a few details about the learner.\n\n**What is your current learning level?**",
+            "Great. I have your source material. Before I create the course, I need a few details about the learner.\n\n**What is your current learning level?**",
         },
       ]);
     } catch (error) {
+      setIngestionError(error instanceof Error ? error.message : "Unable to add source.");
       setCourseSetupStep("idle");
 
       setChatMessages((prev) => [
@@ -688,7 +731,7 @@ function App() {
           content:
             error instanceof Error
               ? error.message
-              : "Unable to upload PDF.",
+              : "Unable to add source.",
         },
       ]);
     } finally {
@@ -787,6 +830,7 @@ function App() {
           {
             method: "POST",
             headers: {
+              Accept: "application/x-ndjson",
               "Content-Type":
                 "application/json",
             },
@@ -821,17 +865,10 @@ function App() {
           );
         }
 
-        const payload =
-          (await response.json()) as {
-            documentId: number;
-            filename: string;
-            level: string;
-            persona: string;
-            goal: string;
-            course: GeneratedCourse;
-          };
+        const payload = await readCourseGeneration(response, () => {});
 
         setGeneratedCourse(payload.course);
+        setIsCourseEditorOpen(true);
       
       } catch (error) {
         setChatMessages((prev) => [
@@ -1109,6 +1146,7 @@ function App() {
           modules?: CourseModule[];
           images?: string[];
           updatedAt?: string;
+          status?: "draft" | "published";
           course?: GeneratedCourse;
           creatorName?: string;
           domain?: string;
@@ -1119,6 +1157,7 @@ function App() {
       setSavedDraftCourses(
         payload.map((course) => ({
           id: course.id,
+          status: course.status ?? (course.course ? "published" : "draft"),
           title: course.title,
           description:
             course.description,
@@ -1167,7 +1206,7 @@ function App() {
   }, [activeScreen]);
 
   const feedCourses: FeedCourse[] = savedDraftCourses
-    .filter((item): item is SavedCourseDraft & { course: GeneratedCourse } => Boolean(item.course?.modules?.some(module => module.slides?.length)))
+    .filter((item): item is SavedCourseDraft & { course: GeneratedCourse } => item.status === "published" && Boolean(item.course?.modules?.some(module => module.slides?.length)))
     .map(item => ({ id: item.id, title: item.title || item.course.title, description: item.description || item.course.description, audience: item.audience, coverImage: item.coverImage, updatedAt: item.updatedAt, creatorName: item.creatorName, domain: item.domain, category: item.category, topics: item.topics, course: item.course }));
 
   const savedDraftCards: CourseCard[] =
@@ -1175,13 +1214,13 @@ function App() {
       title: course.title,
       category:
         course.audience || "General",
-      status: "Draft",
+      status: course.status === "published" ? "Posted" : "Draft",
       progress: "Saved",
       description:
         course.description,
-      action: course.course
+      action: course.course && course.status === "published"
         ? "Open Course"
-        : "View draft",
+        : course.course ? "Edit draft" : "View draft",
       savedCourseId: course.id,
       moduleCount: course.course?.modules?.length ?? course.modules.length,
       slideCount: course.course?.modules?.reduce(
@@ -1203,6 +1242,14 @@ function App() {
     if (!savedCourseId) return;
     const saved = savedDraftCourses.find((item) => item.id === savedCourseId);
     if (!saved) return;
+    if (saved.course && saved.status === "draft") {
+      setGeneratedCourse(saved.course);
+      setEditingSavedCourseId(saved.id);
+      setIsCourseEditorOpen(true);
+      setCourseSaveMessage("");
+      setActiveScreen("creator");
+      return;
+    }
     if (saved.course) {
       setSelectedSavedCourse(saved.course);
       setActiveScreen("courses");
@@ -1359,6 +1406,7 @@ function App() {
           },
           body: JSON.stringify({
             course: generatedCourse,
+            status: "draft",
             audience: [
               courseLevel,
               coursePersona,
@@ -1390,8 +1438,11 @@ function App() {
         );
       }
 
+      try { localStorage.removeItem(EDITOR_DRAFT_KEY); } catch { /* Database save still succeeds. */ }
+      setRecoverableDraft(null);
       await fetchSavedCourses();
       setGeneratedCourse(null);
+      setEditingSavedCourseId(null);
       setSelectedSavedCourse(null);
       setChatMessages([]);
       setCourseSetupStep("idle");
@@ -1400,16 +1451,42 @@ function App() {
       setCourseGoal("");
       setActiveDocumentId(null);
       
-      setCourseSaveMessage("Course saved successfully in My Courses & Drafts.",);
-      
+      setCourseSaveMessage("Course saved to Creator Studio drafts.");
       setCourseTab("Draft");
-      setActiveScreen("courses");
+      setActiveScreen("creator");
     } catch (error) {
       setCourseSaveMessage(
         error instanceof Error
           ? error.message
           : "Unable to save course.",
       );
+    } finally {
+      setIsSavingCourse(false);
+    }
+  };
+
+  const handlePublishSavedCourse = async () => {
+    if (!generatedCourse || !editingSavedCourseId || isSavingCourse) return;
+    setIsSavingCourse(true);
+    setCourseSaveMessage("");
+    try {
+      const response = await fetch(`${API_BASE}/api/courses/${editingSavedCourseId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ course: generatedCourse, status: "published" }),
+      });
+      const payload = await response.json().catch(() => ({})) as { error?: string };
+      if (!response.ok) throw new Error(payload.error || `Unable to publish course (${response.status})`);
+      try { localStorage.removeItem(EDITOR_DRAFT_KEY); } catch { /* Database save still succeeds. */ }
+      setRecoverableDraft(null);
+      setGeneratedCourse(null);
+      setEditingSavedCourseId(null);
+      await fetchSavedCourses();
+      setCourseTab("All");
+      setCourseSaveMessage("Course saved to My Courses and published to Home Feed.");
+      setActiveScreen("courses");
+    } catch (error) {
+      setCourseSaveMessage(error instanceof Error ? error.message : "Unable to publish course.");
     } finally {
       setIsSavingCourse(false);
     }
@@ -1438,7 +1515,7 @@ function App() {
               "application/json",
           },
           body: JSON.stringify(
-            draftCourse,
+            { ...draftCourse, status: "draft" },
           ),
         },
       );
@@ -1470,7 +1547,7 @@ function App() {
 
       await fetchSavedCourses();
 
-      setCourseTab("Posted");
+      setCourseTab("Draft");
       setActiveScreen("creator");
     } catch (error) {
       setDraftSaveMessage(
@@ -1558,9 +1635,10 @@ function App() {
     setIsHistoryOpenState(false);
   }
 
-  function startPdfUpload(): void {
+  function startContentIngestion(): void {
     if (isUploading || isGeneratingCourse) return;
-    fileInputRef.current?.click();
+    setIngestionError("");
+    setIsIngestionOpen(true);
   }
 
   /* =====================================================
@@ -1838,10 +1916,58 @@ function App() {
 
   return (
     <div className="app-shell">
+      {isIngestionOpen && <dialog
+        ref={(dialog) => {
+          if (dialog && !dialog.open) dialog.showModal();
+        }}
+        className="ingestion-dialog"
+        aria-labelledby="ingestion-title"
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!isUploading) setIsIngestionOpen(false);
+        }}
+      >
+        <button type="button" className="ingestion-close" aria-label="Close source dialog" disabled={isUploading} onClick={() => setIsIngestionOpen(false)}>×</button>
+        <p className="ingestion-eyebrow">COURSE SOURCE</p>
+        <h1 id="ingestion-title">Add learning material</h1>
+        <button
+          type="button"
+          className={`ingestion-file-button${isFileDragActive ? " is-dragging" : ""}`}
+          disabled={isUploading}
+          onClick={() => fileInputRef.current?.click()}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            if (!isUploading && event.dataTransfer.types.includes("Files")) setIsFileDragActive(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDragLeave={(event) => {
+            if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setIsFileDragActive(false);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setIsFileDragActive(false);
+            const file = event.dataTransfer.files[0];
+            if (file) void ingestSource(file);
+          }}
+        >
+          <span aria-hidden="true">＋</span>
+          <span><strong>Choose a file</strong><small>{isFileDragActive ? "Drop your file to upload" : "PDF, DOCX, PPTX · Maximum 20MB"}</small></span>
+        </button>
+        <div className="ingestion-divider">OR ADD A LINK</div>
+        <form className="ingestion-url-form" onSubmit={(event) => { event.preventDefault(); void ingestSource(sourceUrl); }}>
+          <input type="url" required aria-label="Webpage or PDF URL" placeholder="https://example.com/article" value={sourceUrl} disabled={isUploading} onChange={(event) => setSourceUrl(event.target.value)} />
+          <button type="submit" disabled={isUploading || !sourceUrl.trim()}>{isUploading ? "Adding…" : "Add link"}</button>
+        </form>
+        {isUploading && <p role="status">Reading your source material…</p>}
+        {ingestionError && <p role="alert">{ingestionError}</p>}
+      </dialog>}
       <input
         ref={fileInputRef}
         type="file"
-        accept="application/pdf,.pdf"
+        accept=".pdf,.docx,.pptx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.presentationml.presentation"
         hidden
         onChange={(event) => void handleFileSelected(event)}
       />
@@ -1860,7 +1986,7 @@ function App() {
             </div>
           </div>
 
-          <button type="button" className="sidebar-create-button" onClick={startPdfUpload} disabled={isUploading || isGeneratingCourse}>
+          <button type="button" className="sidebar-create-button" onClick={startContentIngestion} disabled={isUploading || isGeneratingCourse}>
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg> Create Course
           </button>
 
@@ -1876,6 +2002,7 @@ function App() {
                       : "nav-item"
                   }
                   onClick={() => {
+                    setIsCourseEditorOpen(false);
                     if (item.id === "courses") {
                       setSelectedSavedCourse(null);
                       setCourseTab("All");
@@ -2054,25 +2181,36 @@ function App() {
             )}
 
             {/* Empty home */}
-            {generatedCourse ? (
-              <CourseViewer
+            {isCourseEditorOpen && generatedCourse && editingSavedCourseId === null ? (
+              <CourseEditor
                 course={generatedCourse}
-                onSave={() =>
-                  void handleSaveGeneratedCourse()
-                }
-                isSaving={isSavingCourse}
+                documentId={activeDocumentIdRef.current ?? activeDocumentId}
+                apiBase={API_BASE}
+                onChange={setGeneratedCourse}
+                onPublish={() => void handleSaveGeneratedCourse()}
+                isPublishing={isSavingCourse}
+                publishError={courseSaveMessage}
+                publishLabel="Save to Creator Studio"
               />
             )
   : chatMessages.length ===
             0 ? (
               <section className="chat-home aura-home-feed">
+                {recoverableDraft && <div className="ce-resume"><span>Unpublished draft: <strong>{recoverableDraft.course.title}</strong></span><button onClick={() => {
+                  setGeneratedCourse(recoverableDraft.course);
+                  setEditingSavedCourseId(null);
+                  setIsCourseEditorOpen(true);
+                  setActiveDocumentId(recoverableDraft.documentId);
+                  activeDocumentIdRef.current = recoverableDraft.documentId;
+                  setCourseSaveMessage("");
+                }}>Resume editing</button></div>}
                 <div className="chat-home-content">
                   <CourseFeed
                     courses={feedCourses}
                     loading={isLoadingCourses}
                     error={courseError}
                     onRefresh={() => void fetchSavedCourses()}
-                    onCreate={startPdfUpload}
+                    onCreate={startContentIngestion}
                     composer={<>
                   <div className="chat-home-title"><h2>Ask AURA anything</h2></div>
 
@@ -2088,13 +2226,13 @@ function App() {
                       type="button"
                       className="chat-home-attach"
                       onClick={() =>
-                        fileInputRef.current?.click()
+                        startContentIngestion()
                       }
                       disabled={
                         isUploading
                       }
-                      title="Upload PDF"
-                      aria-label="Upload PDF"
+                      title="Add source: PDF, DOCX, PPTX, or link"
+                      aria-label="Add source: PDF, DOCX, PPTX, or link"
                     >
                       ＋
                     </button>
@@ -2242,19 +2380,19 @@ function App() {
                     </div>
                   )}
 
-                  {(isSending ||
-                    isUploading ||
-                    isGeneratingCourse) && (
+                  {(isSending || isUploading || isGeneratingCourse) && (
                     <div className="chat-message-row assistant">
-                      <div className="aura-thinking">
+                      <div className="aura-thinking" role="status" aria-live="polite">
                         <span className="aura-thinking-name">
                           AURA
                         </span>
 
                         <span className="aura-thinking-text">
                           {isGeneratingCourse
-                            ? "is creating your course"
-                            : "is thinking"}
+                            ? "is generating your course"
+                            : isUploading
+                              ? "is reading your source material"
+                              : "is thinking"}
                         </span>
 
                         <span className="thinking-dots">
@@ -2284,9 +2422,9 @@ function App() {
                   <button
                     type="button"
                     className="icon-button"
-                    title="Upload PDF"
+                    title="Add source: PDF, DOCX, PPTX, or link"
                     onClick={() =>
-                      fileInputRef.current?.click()
+                      startContentIngestion()
                     }
                     disabled={
                       isUploading ||
@@ -2685,6 +2823,24 @@ function App() {
 
         {activeScreen ===
           "creator" && (
+          isCourseEditorOpen && editingSavedCourseId !== null && generatedCourse ? (
+            <CourseEditor
+              course={generatedCourse}
+              documentId={activeDocumentIdRef.current ?? activeDocumentId}
+              apiBase={API_BASE}
+              onChange={setGeneratedCourse}
+              onPublish={() => void handlePublishSavedCourse()}
+              isPublishing={isSavingCourse}
+              publishError={courseSaveMessage}
+              publishLabel="Save to Course Studio & Publish"
+              onBack={() => {
+                setGeneratedCourse(null);
+                setEditingSavedCourseId(null);
+                setIsCourseEditorOpen(false);
+                setCourseSaveMessage("");
+              }}
+            />
+          ) : (
           <section className="stack">
             <div className="panel hero-strip">
               <div>
@@ -2741,13 +2897,19 @@ function App() {
               </div>
             )}
 
+            {courseSaveMessage && (
+              <div className="preview-alert" role="status">
+                {courseSaveMessage}
+              </div>
+            )}
+
             {isLoadingCourses && (
               <div className="table-footer">
                 Loading saved drafts...
               </div>
             )}
 
-            {visibleCourses.length === 0 && !isLoadingCourses && !courseError ? <div className="panel course-empty-state"><span className="empty-state-symbol">✦</span><h2>No drafts here yet</h2><p>Build a course draft or upload a PDF to begin.</p><button type="button" className="primary-button" onClick={() => setActiveScreen("builder")}>Create a draft</button></div> : <div className="course-grid">
+            {visibleCourses.length === 0 && !isLoadingCourses && !courseError ? <div className="panel course-empty-state"><span className="empty-state-symbol">✦</span><h2>No drafts here yet</h2><p>Build a course draft or add a PDF, DOCX, PPTX, or link to begin.</p><button type="button" className="primary-button" onClick={() => setActiveScreen("builder")}>Create a draft</button></div> : <div className="course-grid">
               {visibleCourses.map(
                 (course) => (
                   <article
@@ -2801,6 +2963,7 @@ function App() {
               )}
             </div>}
           </section>
+          )
         )}
 
         {/* =================================================
@@ -2834,7 +2997,7 @@ function App() {
                   <button
                     type="button"
                     className="primary-button"
-                    onClick={startPdfUpload}
+                    onClick={startContentIngestion}
                   >
                     Create Course
                   </button>
@@ -2849,6 +3012,7 @@ function App() {
                 <div className="tabs-row">
                   {[
                     "All",
+                    "Posted",
                     "Draft",
                   ].map((tab) => (
                     <button
@@ -2879,7 +3043,7 @@ function App() {
                     {courseError}
                   </div>
                 ) : visibleCourses.length === 0 ? (
-                  <div className="panel course-empty-state"><span className="empty-state-symbol">✦</span><h2>{courseTab === "All" ? "Your course library starts here" : "No drafts yet"}</h2><p>Upload a PDF to create a course and it will appear here.</p><button type="button" className="primary-button" onClick={startPdfUpload}>Upload a PDF</button></div>
+                  <div className="panel course-empty-state"><span className="empty-state-symbol">✦</span><h2>{courseTab === "All" ? "Your course library starts here" : "No drafts yet"}</h2><p>Add a PDF, DOCX, PPTX, or link to create a course and it will appear here.</p><button type="button" className="primary-button" onClick={startContentIngestion}>Add source</button></div>
                 ) : (
                   <div className="course-grid">
                     {visibleCourses.map((course) => (
