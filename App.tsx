@@ -251,6 +251,14 @@ const learnerGoalOptions = [
 ];
 
 function App() {
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    try {
+      return localStorage.getItem("aura-theme") === "dark" ? "dark" : "light";
+    } catch {
+      return "light";
+    }
+  });
+
   const [activeScreen, setActiveScreen] =
     useState<ScreenId>("home");
 
@@ -355,7 +363,7 @@ function App() {
   const [recoverableDraft, setRecoverableDraft] = useState<{ course: GeneratedCourse; documentId: number | null } | null>(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(EDITOR_DRAFT_KEY) || "null");
-      if (saved?.course && typeof saved.course.title === "string" && Array.isArray(saved.course.modules) && Array.isArray(saved.course.assessment)) return saved;
+      if (saved?.course && typeof saved.course.title === "string" && Array.isArray(saved.course.modules) && (Array.isArray(saved.course.assessment) || Array.isArray(saved.course.assessments))) return saved;
     } catch { /* Browser storage may be disabled. */ }
     return null;
   });
@@ -397,6 +405,14 @@ function App() {
 
   const activeDocumentIdRef =
     useRef<number | null>(null);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("aura-theme", theme);
+    } catch {
+    }
+  }, [theme]);
 
   const [sessionId, setSessionId] =
     useState<string>(() => {
@@ -1243,6 +1259,8 @@ function App() {
     const saved = savedDraftCourses.find((item) => item.id === savedCourseId);
     if (!saved) return;
     if (saved.course && saved.status === "draft") {
+      setActiveDocumentId(saved.course.sourceDocumentId ?? null);
+      activeDocumentIdRef.current = saved.course.sourceDocumentId ?? null;
       setGeneratedCourse(saved.course);
       setEditingSavedCourseId(saved.id);
       setIsCourseEditorOpen(true);
@@ -1396,6 +1414,7 @@ function App() {
     setCourseSaveMessage("");
 
     try {
+      const sourceDocumentId = activeDocumentIdRef.current ?? activeDocumentId;
       const response = await fetch(
         `${API_BASE}/api/courses`,
         {
@@ -1405,7 +1424,7 @@ function App() {
               "application/json",
           },
           body: JSON.stringify({
-            course: generatedCourse,
+            course: { ...generatedCourse, sourceDocumentId },
             status: "draft",
             audience: [
               courseLevel,
@@ -2030,7 +2049,7 @@ function App() {
       <main className={activeScreen === "home" ? "content content-home" : "content"}>
         <header className="top-bar">
           <div>
-            <div className="eyebrow">YOUR CREATIVE SPACE <span className="top-bar-divider">/</span> AURA</div>
+            <div className="eyebrow">YOUR CREATIVE SPACE <span className="top-bar-divider"></span></div>
 
             <h1>
               {
@@ -2062,6 +2081,26 @@ function App() {
               <span>New chat</span>
             </button>
             )}
+
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={() => setTheme(theme === "light" ? "dark" : "light")}
+              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+              aria-pressed={theme === "dark"}
+              title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+            >
+              {theme === "light" ? (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20.2 15.1A8.4 8.4 0 0 1 8.9 3.8 8.5 8.5 0 1 0 20.2 15.1Z" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4" />
+                  <path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42" />
+                </svg>
+              )}
+            </button>
 
             <div className="avatar">
               SA
