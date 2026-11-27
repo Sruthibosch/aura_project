@@ -1,3 +1,4 @@
+import { presentationStyle, renderStyledLines, renderStyledText, type Design, type TextStyles } from "./CourseViewer";
 import { AuraMark, DomainIcon } from "./BrandIcons";
 import {
   useEffect,
@@ -17,14 +18,20 @@ type Slide = {
   keyPoints?: string[];
   example?: string;
   imageUrl?: string;
+  imageAlt?: string;
+  design?: Design;
+  textStyles?: TextStyles;
 };
 type Question = {
+  moduleIndex?: number;
   question: string;
   options?: string[];
   correctAnswer?: string;
   explanation?: string;
 };
 type Course = CourseDomainMetadata & {
+  design?: Design;
+  overview?: Slide;
   title: string;
   description: string;
   learningObjectives?: string[];
@@ -32,12 +39,15 @@ type Course = CourseDomainMetadata & {
     title: string;
     introduction?: string;
     learningObjectives?: string[];
+    textStyles?: TextStyles;
     slides: Slide[];
     recap?: string | string[];
   }[];
+  recap?: Slide;
   assessment?: Question[];
+  assessments?: Question[];
 };
-type Page = Slide & { coverSeed?: string; label: string; kind: "cover" | "overview" | "lesson" | "recap" | "assessment"; questions?: Question[] };
+type Page = Slide & { coverSeed?: string; label: string; moduleTitle?: string; moduleLabelPrefix?: string; moduleTitleStyles?: TextStyles["moduleTitle"]; kind: "cover" | "overview" | "lesson" | "recap" | "assessment"; questions?: Question[]; questionIndexes?: number[]; moduleIndex?: number; continueLabel?: string };
 export type FeedCourse = CourseDomainMetadata & {
   id: number;
   title: string;
@@ -55,39 +65,75 @@ type Props = {
   onRefresh: () => void;
   onCreate: () => void;
   composer?: ReactNode;
+  apiBase?: string;
 };
-type Comment = { id: string; text: string; createdAt: string };
-type Reactions = { liked: boolean; bookmarked: boolean; comments: Comment[] };
+type Comment = { id: string; authorName: string; text: string; createdAt: string };
+type Reactions = { liked: boolean; likeCount: number; commentCount: number; bookmarked: boolean; comments: Comment[] };
 type SocialState = Record<string, Reactions>;
-const SOCIAL_KEY = "aura.course-feed.social.v1";
-const emptyReactions: Reactions = { liked: false, bookmarked: false, comments: [] };
+const SOCIAL_VISITOR_KEY = "aura.course-feed.visitor.v1";
+const emptyReactions: Reactions = { liked: false, likeCount: 0, commentCount: 0, bookmarked: false, comments: [] };
 
-// The supplied backend has no social endpoints. This adapter stores this browser's
-// reactions. Replace it with your authenticated API to share activity between users.
-function readSocial(): SocialState {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(SOCIAL_KEY) || "{}");
-    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-    const result: SocialState = {};
-    Object.entries(value).forEach(([id, raw]) => {
-      if (!/^\d+$/.test(id) || !raw || typeof raw !== "object") return;
-      const item = raw as Partial<Reactions>;
-      result[id] = {
-        liked: item.liked === true,
-        bookmarked: item.bookmarked === true,
-        comments: Array.isArray(item.comments)
-          ? item.comments.filter((comment): comment is Comment => Boolean(comment && typeof comment.id === "string" && typeof comment.text === "string" && typeof comment.createdAt === "string"))
-          : [],
-      };
-    });
-    return result;
-  } catch {
-    return {};
+function correctOptionIndex(question: Question): number {
+  const options = question.options ?? [];
+  const normalize = (text: string) => text.trim().toLowerCase().replace(/\s+/g, " ");
+  const answer = normalize(question.correctAnswer ?? "");
+  const exact = options.findIndex(option => normalize(option) === answer);
+  if (exact >= 0) return exact;
+  const withoutLabel = (text: string) => normalize(text).replace(/^[a-z][.)]\s*/, "");
+  const byText = options.findIndex(option => withoutLabel(option) === withoutLabel(answer));
+  if (byText >= 0) return byText;
+  const label = answer.match(/^(?:option\s+)?([a-z])[.)]?$/);
+  if (label) {
+    const index = label[1].charCodeAt(0) - 97;
+    return index < options.length ? index : -1;
   }
+  return -1;
+}
+
+function getVisitorId(): string {
+  const saved = localStorage.getItem(SOCIAL_VISITOR_KEY);
+  if (saved) return saved;
+  const visitorId = crypto.randomUUID();
+  localStorage.setItem(SOCIAL_VISITOR_KEY, visitorId);
+  return visitorId;
+}
+
+function getOpeningQuestion(content?: string): string {
+  const text = content?.trim() ?? "";
+  const questionEnd = text.indexOf("?");
+  if (questionEnd < 0) return "";
+  const sentenceEnd = [text.indexOf("."), text.indexOf("!")]
+    .filter(position => position >= 0)
+    .reduce((first, position) => Math.min(first, position), Infinity);
+  return questionEnd < sentenceEnd ? text.slice(0, questionEnd + 1) : "";
+}
+
+function removeOpeningQuizHook(content?: string): string {
+  const text = content?.trim() ?? "";
+  const question = getOpeningQuestion(text);
+  if (!question) return text;
+  return text.slice(question.length)
+    .replace(/^\s*(?:Take a moment|Pause|Consider your prediction|Keep your prediction)[^.!?]*[.!?]\s*/i, "")
+    .trim();
 }
 
 function coursePages(item: FeedCourse): Page[] {
   const course = item.course;
+  const assessment = course.assessment?.length ? course.assessment : course.assessments ?? [];
+  const modules = course.modules ?? [];
+  const hasModuleAssignments = assessment.some(question => Number.isInteger(question.moduleIndex));
+  const questionIndexesByModule = modules.map((_, moduleIndex) => {
+    if (hasModuleAssignments) {
+      return assessment.flatMap((question, questionIndex) =>
+        question.moduleIndex === moduleIndex + 1 ? [questionIndex] : [],
+      );
+    }
+    const baseCount = Math.floor(assessment.length / modules.length);
+    const remainder = assessment.length % modules.length;
+    const count = baseCount + (moduleIndex < remainder ? 1 : 0);
+    const start = moduleIndex * baseCount + Math.min(moduleIndex, remainder);
+    return Array.from({ length: count }, (_, index) => start + index);
+  });
   const pages: Page[] = [{
     title: course.title || item.title,
     content: "",
@@ -96,26 +142,54 @@ function coursePages(item: FeedCourse): Page[] {
     label: "",
     kind: "cover",
   }, {
-    title: "Course overview",
-    content: course.description || item.description,
-    keyPoints: course.learningObjectives,
+    ...(course.overview ?? {}),
+    title: course.overview?.title || "Course overview",
+    content: removeOpeningQuizHook(course.overview?.content) || course.description || item.description,
+    keyPoints: course.overview?.keyPoints || course.learningObjectives,
     label: "COURSE OVERVIEW",
     kind: "overview",
   }];
-  (course.modules ?? []).forEach((module, index) => {
-    const label = `MODULE ${String(index + 1).padStart(2, "0")} · ${module.title}`;
+  modules.forEach((module, index) => {
+    const moduleLabel = `MODULE ${String(index + 1).padStart(2, "0")} · `;
+    const label = `${moduleLabel}${module.title}`;
     if (module.introduction || module.learningObjectives?.length) {
-      pages.push({ title: module.title, content: module.introduction || "", keyPoints: module.learningObjectives, label, kind: "lesson" });
+      pages.push({ title: module.title, content: module.introduction || "", textStyles: { title: module.textStyles?.moduleTitle ?? [] }, keyPoints: module.learningObjectives, label, moduleTitle: module.title, moduleLabelPrefix: moduleLabel, moduleTitleStyles: module.textStyles?.moduleTitle, kind: "lesson" });
     }
-    pages.push(...(module.slides ?? []).map(slide => ({ ...slide, label, kind: "lesson" as const })));
+    pages.push(...(module.slides ?? []).map(slide => ({ ...slide, label, moduleTitle: module.title, moduleLabelPrefix: moduleLabel, moduleTitleStyles: module.textStyles?.moduleTitle, kind: "lesson" as const })));
     if (module.recap?.length) {
-      pages.push({ title: "Module recap", content: typeof module.recap === "string" ? module.recap : "", keyPoints: Array.isArray(module.recap) ? module.recap : undefined, label, kind: "recap" });
+      pages.push({ title: "Module recap", content: typeof module.recap === "string" ? module.recap : "", keyPoints: Array.isArray(module.recap) ? module.recap : undefined, label, moduleTitle: module.title, moduleLabelPrefix: moduleLabel, moduleTitleStyles: module.textStyles?.moduleTitle, kind: "recap" });
+    }
+    const questionIndexes = questionIndexesByModule[index] ?? [];
+    if (questionIndexes.length) {
+      const nextModule = modules[index + 1];
+      pages.push({
+        title: "Quick check",
+        content: `Answer all ${questionIndexes.length} questions to continue.`,
+        label: `${moduleLabel}QUICK CHECK`,
+        moduleTitle: module.title,
+        moduleLabelPrefix: moduleLabel,
+        moduleTitleStyles: module.textStyles?.moduleTitle,
+        kind: "assessment",
+        questions: questionIndexes.map(questionIndex => assessment[questionIndex]),
+        questionIndexes,
+        moduleIndex: index,
+        continueLabel: nextModule
+          ? `Continue to Module ${String(index + 2).padStart(2, "0")}`
+          : course.recap ? "View course recap" : "Finish course",
+      });
     }
   });
-  if (course.assessment?.length) {
-    pages.push({ title: "Test your knowledge", content: "Choose your answers, then reveal each explanation.", label: "FINAL ASSESSMENT", kind: "assessment", questions: course.assessment });
+  if (course.recap) {
+    pages.push({ ...course.recap, label: "COURSE RECAP", kind: "recap" });
   }
-  return pages;
+  return pages.map(page => ({ ...page, design: course.design || page.design ? { ...course.design, ...page.design } : undefined }));
+}
+
+function lastUnlockedPageIndex(pages: Page[], answers: Record<number, number>): number {
+  const firstIncompleteQuiz = pages.findIndex(page =>
+    page.kind === "assessment" && page.questionIndexes?.some(questionIndex => answers[questionIndex] === undefined),
+  );
+  return firstIncompleteQuiz < 0 ? pages.length - 1 : firstIncompleteQuiz;
 }
 
 function Icon({ name, filled = false }: { name: "heart" | "comment" | "bookmark" | "expand" | "left" | "right" | "search" | "close" | "book" | "smile"; filled?: boolean }) {
@@ -217,38 +291,70 @@ function CourseCover({ page }: { page: Page }) {
   return <div className="sf-course-cover">
     <img className="sf-cover-image" src={source} alt="" draggable={false} onError={() => setFailedUrl(page.imageUrl || null)} />
     <div className="sf-cover-shade" />
-    <div className="sf-cover-title"><h3 aria-label={page.title}>{splitCoverTitle(page.title).map((line, index) => <span className="sf-cover-title-line" key={index}>{line}</span>)}</h3></div>
+    <div className="sf-cover-title">{page.content && <p className="sf-cover-hook">{page.content}</p>}<h3 aria-label={page.title}>{splitCoverTitle(page.title).map((line, index) => <span className="sf-cover-title-line" key={index}>{line}</span>)}</h3></div>
   </div>;
 }
 
-function PageContent({ page, scope }: { page: Page; scope: string }) {
+function PageContent({ page, scope, answers, onAnswer, onContinue }: {
+  page: Page;
+  scope: string;
+  answers: Record<number, number>;
+  onAnswer: (questionIndex: number, optionIndex: number) => void;
+  onContinue: () => void;
+}) {
   const [brokenImage, setBrokenImage] = useState(false);
+  const questionIndexes = page.questionIndexes ?? page.questions?.map((_, index) => index) ?? [];
+  const allQuestionsAnswered = !!page.questions?.length && questionIndexes.every(questionIndex => answers[questionIndex] !== undefined);
+  useEffect(() => setBrokenImage(false), [page.imageUrl]);
   if (page.kind === "cover") return <CourseCover page={page} />;
-  return <div className={`sf-page-content sf-page-${page.kind}`}>
-    <span className="sf-page-label"><span aria-hidden="true" />{page.label}</span>
-    <h3>{page.title}</h3>
+  return <div className={`sf-page-content sf-page-${page.kind}${page.design ? " edit-presentation" : ""}`} data-template={page.design?.template} style={presentationStyle(page.design)}>
+    <span className="sf-page-label"><span aria-hidden="true" />{page.moduleLabelPrefix !== undefined ? <>{page.moduleLabelPrefix}{renderStyledText(page.moduleTitle ?? "", page.moduleTitleStyles)}</> : page.label}</span>
+    <h3>{renderStyledText(page.title, page.textStyles?.title)}</h3>
     {page.content && <p className="sf-page-copy">{page.content}</p>}
-    {page.imageUrl && !brokenImage && <img className="sf-page-image" src={page.imageUrl} alt="" draggable={false} onError={() => setBrokenImage(true)} />}
+    {page.imageUrl && !brokenImage && <img className="sf-page-image" src={page.imageUrl} alt={page.imageAlt || `Illustration for ${page.title}`} draggable={false} onError={() => setBrokenImage(true)} />}
     {!!page.keyPoints?.length && <section className="sf-takeaways">
       <h4>{page.kind === "overview" ? "What you’ll learn" : page.kind === "recap" ? "Remember these ideas" : "Key takeaways"}</h4>
-      <ul>{page.keyPoints.map((point, index) => <li key={index}><span>{String(index + 1).padStart(2, "0")}</span><p>{point}</p></li>)}</ul>
+      <ul>{renderStyledLines(page.keyPoints, page.textStyles?.keyPoints).map((content, index) => <li key={index}><span>{String(index + 1).padStart(2, "0")}</span><p>{content}</p></li>)}</ul>
     </section>}
     {page.example && <section className="sf-example"><span>IN PRACTICE</span><p>{page.example}</p></section>}
-    {page.questions?.map((question, questionIndex) => <section className="sf-question" key={questionIndex}>
-      <h4>{questionIndex + 1}. {question.question}</h4>
-      {question.options?.map((option, optionIndex) => <label key={optionIndex}><input type="radio" name={`${scope}-question-${questionIndex}`} value={option} />{option}</label>)}
-      <details><summary>Reveal answer</summary><strong>{question.correctAnswer}</strong><p>{question.explanation}</p></details>
-    </section>)}
+    {page.questions?.map((question, index) => {
+      const questionIndex = questionIndexes[index] ?? index;
+      const selected = answers[questionIndex];
+      const answered = selected !== undefined;
+      const correct = correctOptionIndex(question);
+      const isCorrect = answered && selected === correct;
+      return <section className="sf-question" key={questionIndex}>
+        <h4>{questionIndex + 1}. {question.question}</h4>
+        {question.options?.map((option, optionIndex) => {
+          const highlight = answered && (optionIndex === correct || optionIndex === selected);
+          const optionClass = highlight ? optionIndex === correct ? "is-correct" : "is-incorrect" : "";
+          return <label className={optionClass} key={optionIndex}>
+            <input type="radio" name={`${scope}-question-${questionIndex}`} value={optionIndex}
+              checked={selected === optionIndex} disabled={answered}
+              onChange={() => onAnswer(questionIndex, optionIndex)} />
+            {option}
+          </label>;
+        })}
+        {answered && <div className={`sf-question-feedback ${isCorrect ? "is-correct" : "is-incorrect"}`} role="status" aria-live="polite">
+          <strong>{isCorrect ? "Correct!" : "Incorrect."}</strong>
+          <p><strong>Correct answer:</strong> {correct >= 0 ? question.options?.[correct] : question.correctAnswer}</p>
+          {question.explanation && <p>{question.explanation}</p>}
+        </div>}
+      </section>;
+    })}
+    {page.kind === "assessment" && <button type="button" className="sf-quiz-continue" onClick={onContinue} disabled={!allQuestionsAnswered}>{page.continueLabel ?? "Continue"} <Icon name="right" /></button>}
     {page.kind === "overview" && <div className="sf-page-signoff"><Icon name="book" /><span>One course. A new perspective.</span><span aria-hidden="true"><AuraMark /></span></div>}
   </div>;
 }
 
-function Carousel({ pages, index, onChange, onExpand, scope, large = false }: {
+function Carousel({ pages, index, onChange, onExpand, scope, answers, onAnswer, large = false }: {
   pages: Page[];
   index: number;
   onChange: (index: number) => void;
   onExpand?: () => void;
   scope: string;
+  answers: Record<number, number>;
+  onAnswer: (questionIndex: number, optionIndex: number) => void;
   large?: boolean;
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -262,12 +368,20 @@ function Carousel({ pages, index, onChange, onExpand, scope, large = false }: {
     startedAt: number; scrollLeft: number; startIndex: number; axis: "x" | "y" | null;
   } | null>(null);
   const clamp = (value: number) => Math.max(0, Math.min(pages.length - 1, value));
+  const unlockedThrough = lastUnlockedPageIndex(pages, answers);
   const interactive = (target: EventTarget | null) => target instanceof Element && !!target.closest("button, input, textarea, select, label, summary, a, details");
   const scrollToPage = (value: number) => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    const target = clamp(value);
+    if (target > unlockedThrough) {
+      viewport.scrollTo({ left: activeIndex.current * viewport.clientWidth, behavior: "auto" });
+      return;
+    }
+    activeIndex.current = target;
+    changeRef.current(target);
     const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    viewport.scrollTo({ left: clamp(value) * viewport.clientWidth, behavior: reducedMotion ? "auto" : "smooth" });
+    viewport.scrollTo({ left: target * viewport.clientWidth, behavior: reducedMotion ? "auto" : "smooth" });
   };
   // Native scrolling handles finger swipes, trackpads and momentum. Resize keeps the
   // active page aligned, including when the enlarged dialog first becomes visible.
@@ -286,6 +400,17 @@ function Carousel({ pages, index, onChange, onExpand, scope, large = false }: {
     window.addEventListener("resize", alignPage);
     return () => { observer?.disconnect(); window.removeEventListener("resize", alignPage); };
   }, [pages.length]);
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const activePage = viewport.querySelector<HTMLElement>('.sf-carousel-page[data-active="true"]');
+    if (!activePage) return;
+    const updateHeight = () => { viewport.style.height = `${activePage.offsetHeight}px`; };
+    updateHeight();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(updateHeight) : null;
+    observer?.observe(activePage);
+    return () => observer?.disconnect();
+  }, [index, pages.length]);
   function pointerDown(event: ReactPointerEvent<HTMLDivElement>) {
     if (!event.isPrimary || event.button !== 0 || interactive(event.target)) return;
     const viewport = event.currentTarget;
@@ -344,6 +469,10 @@ function Carousel({ pages, index, onChange, onExpand, scope, large = false }: {
         const viewport = event.currentTarget;
         if (!viewport.clientWidth) return;
         const next = clamp(Math.round(viewport.scrollLeft / viewport.clientWidth));
+        if (next > unlockedThrough) {
+          viewport.scrollTo({ left: activeIndex.current * viewport.clientWidth, behavior: "auto" });
+          return;
+        }
         suppressClick.current = true;
         if (next !== activeIndex.current) {
           activeIndex.current = next;
@@ -367,63 +496,93 @@ function Carousel({ pages, index, onChange, onExpand, scope, large = false }: {
         if (suppressClick.current) { suppressClick.current = false; return; }
         if (!interactive(event.target)) onExpand?.();
       }}>
-      {pages.map((page, position) => <div className={`sf-carousel-page${page.kind === "cover" ? " sf-cover-page" : ""}`} key={`${scope}-${position}`} aria-hidden={position !== index} ref={element => { element?.toggleAttribute("inert", position !== index); }}>
-        <PageContent page={page} scope={`${scope}-${position}`} />
+      {pages.map((page, position) => <div className={`sf-carousel-page${page.kind === "cover" ? " sf-cover-page" : ""}`} key={`${scope}-${position}`} data-active={position === index} aria-hidden={position !== index} ref={element => { element?.toggleAttribute("inert", position !== index); }}>
+        <PageContent page={page} scope={`${scope}-${position}`} answers={answers} onAnswer={onAnswer} onContinue={() => scrollToPage(position + 1)} />
       </div>)}
     </div>
+    {large && pages.length > 1 && <>
+      <button type="button" className="sf-slide-arrow previous" onClick={() => scrollToPage(index - 1)} disabled={index === 0} aria-label="Previous slide" title="Previous slide"><Icon name="left" /></button>
+      <button type="button" className="sf-slide-arrow next" onClick={() => scrollToPage(index + 1)} disabled={index === pages.length - 1 || index + 1 > unlockedThrough} aria-label={pages[index + 1]?.kind === "assessment" ? "Module quiz" : "Next slide"} title={pages[index + 1]?.kind === "assessment" ? "Module quiz" : "Next slide"}><Icon name="right" /></button>
+    </>}
     <span className="sf-page-counter" aria-live="polite">{index + 1} / {pages.length}</span>
   </div>;
 }
 
-function CoursePost({ item, domains, reactions, onUpdate, onOpen, onCreator, onDomain }: {
+function CoursePost({ item, domains, reactions, answers, onAnswer, onLike, onComment, onOpen, onCreator, onDomain }: {
   item: FeedCourse;
   domains: string[];
   onDomain: (domain: string) => void;
   reactions: Reactions;
-  onUpdate: (update: (previous: Reactions) => Reactions) => void;
+  answers: Record<number, number>;
+  onAnswer: (questionIndex: number, optionIndex: number) => void;
+  onLike: () => void;
+  onComment: (text: string) => Promise<Comment | null>;
   onOpen: (index: number) => void;
   onCreator: () => void;
 }) {
   const pages = useMemo(() => coursePages(item), [item]);
   const [index, setIndex] = useState(0);
+  const [carouselReset, setCarouselReset] = useState(0);
   const [comment, setComment] = useState("");
   const [showComments, setShowComments] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const postRef = useRef<HTMLElement>(null);
   const creator = creatorName(item);
   const count = item.course.modules.reduce((total, module) => total + (module.slides?.length ?? 0), 0);
   const visibleComments = showComments ? reactions.comments : reactions.comments.slice(-1);
-  return <article className="sf-post" aria-label={`Course post: ${item.title}`}>
+  useEffect(() => {
+    const post = postRef.current;
+    if (!post || typeof IntersectionObserver === "undefined") return;
+    let wasVisible = false;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) {
+        wasVisible = true;
+      } else if (wasVisible) {
+        wasVisible = false;
+        setIndex(0);
+        setCarouselReset(value => value + 1);
+      }
+    });
+    observer.observe(post);
+    return () => observer.disconnect();
+  }, []);
+  return <article ref={postRef} className="sf-post" aria-label={`Course post: ${item.title}`}>
     <header className="sf-post-header">
       <span className="sf-avatar" aria-hidden="true">{initials(creator)}</span>
       <div className="sf-post-author"><div><button type="button" onClick={onCreator}>{creator}</button><time dateTime={item.updatedAt || undefined}>{displayDate(item.updatedAt)}</time></div><small><Icon name="book" />{item.course.modules.length} modules · {count} slides{item.audience ? ` · ${item.audience}` : ""}</small></div>
       <button type="button" className="sf-expand" onClick={() => onOpen(index)} aria-label={`Enlarge ${item.title}`} title="Enlarge course"><Icon name="expand" /></button>
     </header>
-    <Carousel pages={pages} index={Math.min(index, pages.length - 1)} onChange={setIndex} onExpand={() => onOpen(index)} scope={`post-${item.id}`} />
+    <Carousel key={`${item.id}-${carouselReset}`} pages={pages} index={Math.min(index, pages.length - 1)} onChange={setIndex} onExpand={() => onOpen(index)} scope={`post-${item.id}`} answers={answers} onAnswer={onAnswer} />
     <div className="sf-post-social">
       <div className="sf-reaction-row">
-        <button type="button" className={`sf-reaction${reactions.liked ? " is-liked" : ""}`} aria-label={reactions.liked ? "Unlike course" : "Like course"} aria-pressed={reactions.liked} onClick={() => onUpdate(previous => ({ ...previous, liked: !previous.liked }))}><Icon name="heart" filled={reactions.liked} /><span>{reactions.liked ? 1 : 0}</span></button>
-        <button type="button" className="sf-reaction" aria-label="Comment on course" onClick={() => { setShowComments(true); inputRef.current?.focus(); }}><Icon name="comment" /><span>{reactions.comments.length}</span></button>
+        <button type="button" className={`sf-reaction${reactions.liked ? " is-liked" : ""}`} aria-label={reactions.liked ? "Unlike course" : "Like course"} aria-pressed={reactions.liked} onClick={onLike}><Icon name="heart" filled={reactions.liked} /><span>{reactions.likeCount}</span></button>
+        <button type="button" className="sf-reaction" aria-label="Comment on course" onClick={() => { setShowComments(true); inputRef.current?.focus(); }}><Icon name="comment" /><span>{reactions.commentCount}</span></button>
       </div>
       <p className="sf-like-note" aria-live="polite">{reactions.liked ? "Liked by you" : "Like this course"}</p>
       <p className="sf-caption"><strong>{creator}</strong> {item.description || item.course.description}</p>
       <div className="sf-domain-tags" aria-label="Course domains">{domains.map(name => <button type="button" key={name} onClick={() => onDomain(name)}>{name}</button>)}</div>
-      {!!reactions.comments.length && <button className="sf-view-comments" type="button" onClick={() => setShowComments(value => !value)}>{showComments ? "Show fewer comments" : `View all ${reactions.comments.length} ${reactions.comments.length === 1 ? "comment" : "comments"}`}</button>}
+      {!!reactions.commentCount && <button className="sf-view-comments" type="button" onClick={() => setShowComments(value => !value)}>{showComments ? "Show fewer comments" : `View all ${reactions.commentCount} ${reactions.commentCount === 1 ? "comment" : "comments"}`}</button>}
       {showComments && !reactions.comments.length && <p className="sf-comment-empty">Start the conversation. What did you learn?</p>}
-      <div className="sf-comments" aria-live="polite">{visibleComments.map(entry => <div className="sf-comment" key={entry.id}><span className="sf-comment-avatar" aria-hidden="true">Y</span><div><p><strong>You</strong> {entry.text}</p><time dateTime={entry.createdAt}>{displayDate(entry.createdAt)}</time></div></div>)}</div>
-      <form className="sf-comment-form" onSubmit={event => {
+      <div className="sf-comments" aria-live="polite">{visibleComments.map(entry => <div className="sf-comment" key={entry.id}><span className="sf-comment-avatar" aria-hidden="true">{initials(entry.authorName)}</span><div><p><strong>{entry.authorName}</strong> {entry.text}</p><time dateTime={entry.createdAt}>{displayDate(entry.createdAt)}</time></div></div>)}</div>
+      <form className="sf-comment-form" onSubmit={async event => {
         event.preventDefault();
         const text = comment.trim();
         if (!text) return;
-        const entry: Comment = { id: typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`, text: text.slice(0, 1000), createdAt: new Date().toISOString() };
-        onUpdate(previous => ({ ...previous, comments: [...previous.comments, entry] }));
-        setComment("");
-        setShowComments(true);
+        try {
+          const entry = await onComment(text.slice(0, 1000));
+          if (entry) {
+            setComment("");
+            setShowComments(true);
+          }
+        } catch {
+          // Keep the draft text available when the API rejects the comment.
+        }
       }}><span aria-hidden="true"><Icon name="smile" /></span><input ref={inputRef} value={comment} onChange={event => setComment(event.target.value)} placeholder="Add a comment or ask a question…" aria-label={`Comment on ${item.title}`} maxLength={1000} /><button type="submit" disabled={!comment.trim()}>Post</button></form>
     </div>
   </article>;
 }
 
-function ExpandedCourse({ item, initialIndex, onClose }: { item: FeedCourse; initialIndex: number; onClose: () => void }) {
+function ExpandedCourse({ item, initialIndex, answers, onAnswer, onClose }: { item: FeedCourse; initialIndex: number; answers: Record<number, number>; onAnswer: (questionIndex: number, optionIndex: number) => void; onClose: () => void }) {
   const pages = useMemo(() => coursePages(item), [item]);
   const [index, setIndex] = useState(Math.min(initialIndex, pages.length - 1));
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -442,27 +601,83 @@ function ExpandedCourse({ item, initialIndex, onClose }: { item: FeedCourse; ini
   return <dialog className="sf-dialog" ref={dialogRef} aria-label={item.title} onCancel={onClose} onClick={event => { if (event.target === event.currentTarget) onClose(); }}>
     <div className="sf-expanded">
       <header><div><span className="sf-eyebrow">{creatorName(item)} · COURSE</span><h2>{item.title}</h2></div><button type="button" className="sf-expand" aria-label="Close course" onClick={onClose}><Icon name="close" /></button></header>
-      <Carousel pages={pages} index={index} onChange={setIndex} scope={`expanded-${item.id}`} large />
+      <Carousel pages={pages} index={index} onChange={setIndex} scope={`expanded-${item.id}`} answers={answers} onAnswer={onAnswer} large />
     </div>
   </dialog>;
 }
 
-export default function CourseFeed({ courses, loading, error, onRefresh, onCreate, composer }: Props) {
-  const [social, setSocial] = useState<SocialState>(readSocial);
-  const [storageError, setStorageError] = useState("");
+export default function CourseFeed({ courses, loading, error, onRefresh, onCreate, composer, apiBase = "http://127.0.0.1:5000" }: Props) {
+  const [social, setSocial] = useState<SocialState>({});
+  const [socialError, setSocialError] = useState("");
   const [query, setQuery] = useState("");
   const [domain, setDomain] = useState("");
   const [creator, setCreator] = useState("");
   const [selected, setSelected] = useState<{ id: number; index: number } | null>(null);
+  const [quizAnswers, setQuizAnswers] = useState<Record<number, Record<number, number>>>({});
+  const recordQuizAnswer = (courseId: number, questionIndex: number, optionIndex: number) => {
+    setQuizAnswers(previous => {
+      const courseAnswers = previous[courseId] ?? {};
+      if (courseAnswers[questionIndex] !== undefined) return previous;
+      return { ...previous, [courseId]: { ...courseAnswers, [questionIndex]: optionIndex } };
+    });
+  };
   useEffect(() => {
-    try { localStorage.setItem(SOCIAL_KEY, JSON.stringify(social)); setStorageError(""); }
-    catch { setStorageError("Your changes are visible now, but this browser could not save them for your next visit."); }
-  }, [social]);
-  useEffect(() => {
-    const sync = (event: StorageEvent) => { if (event.key === SOCIAL_KEY || event.key === null) setSocial(readSocial()); };
-    window.addEventListener("storage", sync);
-    return () => window.removeEventListener("storage", sync);
-  }, []);
+    let cancelled = false;
+    if (!courses.length) return () => { cancelled = true; };
+    const visitorId = getVisitorId();
+    Promise.all(courses.map(async item => {
+      const response = await fetch(`${apiBase}/api/courses/${item.id}/social?visitorId=${encodeURIComponent(visitorId)}`);
+      if (!response.ok) throw new Error(`Unable to load course activity (${response.status})`);
+      const data = await response.json() as { liked?: boolean; likeCount?: number; commentCount?: number; comments?: Array<{ id: string | number; authorName?: string; text: string; createdAt: string }> };
+      return [String(item.id), {
+        liked: data.liked === true,
+        likeCount: Number(data.likeCount) || 0,
+        commentCount: Number(data.commentCount) || 0,
+        bookmarked: false,
+        comments: Array.isArray(data.comments) ? data.comments.map(comment => ({ id: String(comment.id), authorName: comment.authorName || "AURA Learner", text: comment.text, createdAt: comment.createdAt })) : [],
+      }] as const;
+    })).then(entries => {
+      if (!cancelled) {
+        setSocial(previous => ({ ...previous, ...Object.fromEntries(entries) }));
+        setSocialError("");
+      }
+    }).catch(reason => {
+      if (!cancelled) setSocialError(reason instanceof Error ? reason.message : "Unable to load course activity.");
+    });
+    return () => { cancelled = true; };
+  }, [apiBase, courses]);
+  const updateLike = async (courseId: number) => {
+    const visitorId = getVisitorId();
+    const previous = social[courseId] || emptyReactions;
+    const liked = !previous.liked;
+    setSocial(current => ({ ...current, [courseId]: { ...(current[courseId] || emptyReactions), liked, likeCount: Math.max(0, previous.likeCount + (liked ? 1 : -1)) } }));
+    try {
+      const response = await fetch(`${apiBase}/api/courses/${courseId}/like`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ visitorId, liked }) });
+      const data = await response.json() as { error?: string; liked?: boolean; likeCount?: number };
+      if (!response.ok) throw new Error(data.error || `Unable to save like (${response.status})`);
+      setSocial(current => ({ ...current, [courseId]: { ...(current[courseId] || emptyReactions), liked: data.liked === true, likeCount: Number(data.likeCount) || 0 } }));
+      setSocialError("");
+    } catch (reason) {
+      setSocial(current => ({ ...current, [courseId]: previous }));
+      setSocialError(reason instanceof Error ? reason.message : "Unable to save like.");
+    }
+  };
+  const addComment = async (courseId: number, text: string): Promise<Comment | null> => {
+    const response = await fetch(`${apiBase}/api/courses/${courseId}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    const data = await response.json() as { error?: string; id?: string | number; authorName?: string; text?: string; createdAt?: string };
+    if (!response.ok) {
+      const message = data.error || `Unable to save comment (${response.status})`;
+      setSocialError(message);
+      throw new Error(message);
+    }
+    const entry: Comment = { id: String(data.id), authorName: data.authorName || "AURA Learner", text: data.text || text, createdAt: data.createdAt || new Date().toISOString() };
+    setSocial(current => {
+      const previous = current[courseId] || emptyReactions;
+      return { ...current, [courseId]: { ...previous, commentCount: previous.commentCount + 1, comments: [...previous.comments, entry].slice(-100) } };
+    });
+    setSocialError("");
+    return entry;
+  };
   const domainsById = useMemo(() => new Map(courses.map(item => [item.id, getCourseDomains(item)])), [courses]);
   const domains = useMemo(() => {
     const counts = new Map<string, number>();
@@ -484,14 +699,13 @@ export default function CourseFeed({ courses, loading, error, onRefresh, onCreat
     <div className="sf-layout"><div className="sf-main">
       <div className="sf-topic-row" aria-label="Filter by course domain"><button type="button" className={!domain ? "is-active" : ""} aria-pressed={!domain} onClick={() => setDomain("")}>All Topics</button>{domains.map(([name, count]) => <button key={name} type="button" className={domain === name ? "is-active" : ""} aria-pressed={domain === name} onClick={() => setDomain(name)} title={`${count} ${count === 1 ? "course" : "courses"}`}><span aria-hidden="true"><DomainIcon name={name} /></span>{name}</button>)}</div>
       {creator && <div className="sf-filter-note">Courses by {creator}<button type="button" onClick={() => setCreator("")}>Clear filter ×</button></div>}
-      {storageError && <p className="sf-storage-error" role="alert">{storageError}</p>}
-      {loading ? <div className="sf-empty" role="status"><span className="sf-loading-dot" />Loading courses…</div> : error ? <div className="sf-empty" role="alert"><h2>Couldn’t load the feed</h2><p>{error}</p><button type="button" onClick={onRefresh}>Try again</button></div> : !shown.length ? <div className="sf-empty"><Icon name="book" /><h2>{query || domain || creator ? "No matching courses" : "A new idea starts here"}</h2><p>{query || domain || creator ? "Try a different search or clear your filters." : "Create and save a course, then explore it in the feed."}</p><button type="button" onClick={() => { if (query || domain || creator) { setQuery(""); setDomain(""); setCreator(""); } else onCreate(); }}>{query || domain || creator ? "Show all courses" : "Create a course"}</button></div> : <div className="sf-posts">{shown.map(item => <CoursePost key={item.id} item={item} domains={domainsById.get(item.id) || []} onDomain={setDomain} reactions={social[item.id] || emptyReactions} onUpdate={update => setSocial(previous => ({ ...previous, [item.id]: update(previous[item.id] || emptyReactions) }))} onOpen={index => setSelected({ id: item.id, index })} onCreator={() => setCreator(creatorName(item))} />)}</div>}
+      {socialError && <p className="sf-storage-error" role="alert">{socialError}</p>}
+      {loading ? <div className="sf-empty" role="status"><span className="sf-loading-dot" />Loading courses…</div> : error ? <div className="sf-empty" role="alert"><h2>Couldn’t load the feed</h2><p>{error}</p><button type="button" onClick={onRefresh}>Try again</button></div> : !shown.length ? <div className="sf-empty"><Icon name="book" /><h2>{query || domain || creator ? "No matching courses" : "A new idea starts here"}</h2><p>{query || domain || creator ? "Try a different search or clear your filters." : "Create and save a course, then explore it in the feed."}</p><button type="button" onClick={() => { if (query || domain || creator) { setQuery(""); setDomain(""); setCreator(""); } else onCreate(); }}>{query || domain || creator ? "Show all courses" : "Create a course"}</button></div> : <div className="sf-posts">{shown.map(item => <CoursePost key={item.id} item={item} domains={domainsById.get(item.id) || []} onDomain={setDomain} reactions={social[item.id] || emptyReactions} answers={quizAnswers[item.id] ?? {}} onAnswer={(questionIndex, optionIndex) => recordQuizAnswer(item.id, questionIndex, optionIndex)} onLike={() => void updateLike(item.id)} onComment={text => addComment(item.id, text)} onOpen={index => setSelected({ id: item.id, index })} onCreator={() => setCreator(creatorName(item))} />)}</div>}
     </div><aside className="sf-side" aria-label="Discover more">
       <section className="sf-side-card sf-discover"><h2>Meet the creators <span>{creators.length}</span></h2>{creators.length ? creators.slice(0, 4).map(([name, count]) => <div className="sf-creator-row" key={name}><span className="sf-avatar" aria-hidden="true">{initials(name)}</span><div><strong>{name}</strong><small>{count} {count === 1 ? "course" : "courses"}</small></div><button type="button" onClick={() => { setCreator(name); setDomain(""); setQuery(""); }}>View</button></div>) : <p className="sf-side-muted">Creators appear here when courses are available.</p>}</section>
       {!!domains.length && <section className="sf-side-card sf-discover"><h2>Explore topics <span aria-hidden="true"><Icon name="right" /></span></h2><div className="sf-domain-list">{domains.map(([name, count]) => <button className="sf-path" key={name} type="button" onClick={() => { setDomain(name); setCreator(""); setQuery(""); }}><span><strong><DomainIcon name={name} /> {name}</strong><small>{count} {count === 1 ? "course" : "courses"} to explore</small></span><Icon name="right" /></button>)}</div></section>}
       {composer && <section className="sf-side-card sf-assistant">{composer}</section>}
-      <p className="sf-local-note">Likes and comments are saved in this browser.</p>
     </aside></div>
-    {selectedCourse && selected && <ExpandedCourse key={selectedCourse.id} item={selectedCourse} initialIndex={selected.index} onClose={() => setSelected(null)} />}
+    {selectedCourse && selected && <ExpandedCourse key={selectedCourse.id} item={selectedCourse} initialIndex={selected.index} answers={quizAnswers[selectedCourse.id] ?? {}} onAnswer={(questionIndex, optionIndex) => recordQuizAnswer(selectedCourse.id, questionIndex, optionIndex)} onClose={() => setSelected(null)} />}
   </section>;
 }
