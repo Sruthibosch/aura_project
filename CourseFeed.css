@@ -444,3 +444,4 @@ body { background:#f9faff; }
 }
 .sf-search:focus-within { border-color:#4f46e5; box-shadow:0 8px 20px rgba(16,24,40,.16),0 0 0 2px #4f46e51a; }
 @media(prefers-reduced-motion:reduce) { .sf-search { transition:none; transform:none; } }
+
